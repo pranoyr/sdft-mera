@@ -153,6 +153,15 @@ class SDFT(Module):
         student_prompt_ids, student_seq_start_pos = pad_sequence(student_prompt_ids, return_lens = True, left = True, pad_lens = True)
         teacher_prompt_ids, teacher_seq_start_pos = pad_sequence(teacher_prompt_ids, return_lens = True, left = True, pad_lens = True)
 
+        device = next(self.parameters()).device
+        student_prompt_ids = student_prompt_ids.to(device)
+        teacher_prompt_ids = teacher_prompt_ids.to(device)
+        
+        if is_tensor(student_seq_start_pos):
+            student_seq_start_pos = student_seq_start_pos.to(device)
+        if is_tensor(teacher_seq_start_pos):
+            teacher_seq_start_pos = teacher_seq_start_pos.to(device)
+
         student_cache = None
         teacher_cache = None
 
@@ -271,22 +280,25 @@ class SDFTTrainer(Module):
 
         self.max_grad_norm = max_grad_norm
 
-    def forward(self):
+    def train(self, num_epochs=2): 
         self.model.train()
 
-        for questions, answers in self.dataloader:
-            with self.accelerator.accumulate(self.model):
-                output = self.model(questions, answers)
+        for epoch in range(num_epochs):
+            print(f"Starting Epoch {epoch + 1}/{num_epochs}...")
 
-                self.accelerator.backward(output.loss)
+            for questions, answers in self.dataloader:
+                with self.accelerator.accumulate(self.model):
+                    output = self.model(questions, answers)
 
-                if exists(self.max_grad_norm) and self.accelerator.sync_gradients:
-                    self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.accelerator.backward(output.loss)
 
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                    if exists(self.max_grad_norm) and self.accelerator.sync_gradients:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
-                if self.accelerator.sync_gradients:
-                    self.model.update_teacher_ema_()
+                    self.optimizer.step()
+                    self.optimizer.zero_grad()
+
+                    if self.accelerator.sync_gradients:
+                        self.model.update_teacher_ema_()
 
         return output
