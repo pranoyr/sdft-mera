@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import Dataset
 from x_transformers import TransformerWrapper, Decoder 
 from sdft_pytorch import SDFTTrainer
+from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 
 class DummyScienceDataset(Dataset):
     def __init__(self, num_samples=100):
@@ -50,11 +51,17 @@ def encode_prompt_to_tensor(prompt_string: str) -> torch.Tensor:
     return token_dict['input_ids'].squeeze(0)
 
 
-# base model
-base_model = TransformerWrapper(
-    num_tokens = tokenizer.vocab_size,
-    max_seq_len = 2048,
-    attn_layers = Decoder(dim = 512, depth = 6, heads = 8) 
+model_name = "Qwen/Qwen2.5-7B-Instruct"
+
+config = AutoConfig.from_pretrained(model_name)
+config.attention_dropout = 0.0
+config.hidden_dropout = 0.0
+
+base_model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    config=config,
+    torch_dtype=torch.bfloat16,
+    device_map="auto"          
 )
 
 # trainer

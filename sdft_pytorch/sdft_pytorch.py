@@ -174,7 +174,13 @@ class SDFT(Module):
 
             # forward for logit of student and teacher
 
-            student_logits, student_cache = self.student(student_prompt_ids, cache = student_cache, seq_start_pos = student_seq_start_pos, return_intermediates = True)
+            # student_logits, student_cache = self.student(student_prompt_ids, cache = student_cache, seq_start_pos = student_seq_start_pos, return_intermediates = True)
+            outputs = self.student(student_prompt_ids, cache = student_cache, seq_start_pos = student_seq_start_pos, return_intermediates = True)
+
+
+            student_logits = outputs.logits
+            student_cache = outputs.past_key_values
+
 
             with torch.no_grad():
                 self.teacher.eval()
