@@ -168,14 +168,36 @@ class SDFTMERA(Module):
 
         encode = self.tokenizer_encode
 
-        neg_ids_list = None
-        if "mera" in self.training_stage:
-            neg_ids_list = []
-            for negs in hard_negatives:
-                # encode(n) returns a 1D tensor like tensor([8334, 12, ...])
-                # [0] gets the first token, .item() turns it into a plain integer
+        # neg_ids_list = None
+        # if "mera" in self.training_stage:
+            # neg_ids_list = []
+            # for negs in hard_negatives:
+            #     # encode(n) returns a 1D tensor like tensor([8334, 12, ...])
+            #     # [0] gets the first token, .item() turns it into a plain integer
+            #     n_ids = [encode(n)[0].item() for n in negs]
+            #     neg_ids_list.append(n_ids)
+
+        # --- PRE-PROCESS HARD NEGATIVES FOR VECTORIZATION ---
+        padded_negs = None
+        valid_neg_mask = None
+        
+        if "mera" in self.training_stage and exists(hard_negatives):
+            device = next(self.parameters()).device
+            
+            max_negs = max(len(negs) for negs in hard_negatives)
+            
+            padded_negs = torch.zeros((batch_size, max_negs), dtype=torch.long, device=device)
+            valid_neg_mask = torch.zeros((batch_size, max_negs), dtype=torch.bool, device=device)
+            
+            for b, negs in enumerate(hard_negatives):
+                # Encode strings to IDs
                 n_ids = [encode(n)[0].item() for n in negs]
-                neg_ids_list.append(n_ids)
+                
+                padded_negs[b, :len(n_ids)] = torch.tensor(n_ids, device=device)
+                
+                valid_neg_mask[b, :len(n_ids)] = True
+                
+            self.target_vocab_tensor = torch.tensor(list(self.icd_vocab_ids) + [self.eov_id], device=device)
 
         
         assert len(questions) == len(answers)
@@ -248,36 +270,49 @@ class SDFTMERA(Module):
 
             combined_loss = token_kl_div * self.sdft_loss_kl_weight
 
-            # apply MERA if hard neg are provided
-            # if training stage contains word mera
+         
             if "mera" in self.training_stage:
-                mera_loss_step = torch.zeros(batch_size, device=device)
                 student_probs_flat = rearrange(student_token_probs, 'b 1 c -> b c')
                 
-                for b in range(batch_size):
-                   
-                    pos_id = teacher_token_logit[b, 0].argmax(dim=-1).item() 
-                    
-                   # apply mera if its ICD token or EOV token
-                    if pos_id in self.icd_vocab_ids or pos_id == self.eov_id:
-                        pos_prob = student_probs_flat[b, pos_id]
-                        eov_prob = student_probs_flat[b, self.eov_id]
-                        neg_probs = student_probs_flat[b, neg_ids_list[b]]
-                        
-                        # constrative loss
-                        denom = pos_prob + neg_probs.sum()
-                        contrastive_loss = -torch.log(pos_prob / (denom + 1e-8))
-                        
-                        # Dynamic EOV Loss
-                        eov_loss = F.relu(eov_prob - pos_prob) + F.relu(neg_probs - eov_prob).mean()
-                        
-                        mera_loss_step[b] = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
-                        
-                    else:
-                        mera_loss_step[b] = 0.0
+                # teachers prds
+                teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
+
+                pos_ids  = teacher_pos_ids
                 
-                # Add scaled MERA loss to the SDFT loss
-                combined_loss = combined_loss + mera_loss_step.unsqueeze(1)
+                # mask to ignore non ICD and EOv
+                mera_active_mask = torch.isin(teacher_pos_ids, self.target_vocab_tensor) 
+                
+      
+                pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
+                pos_probs_expanded = student_probs_flat.gather(1, pos_ids_expanded) 
+                pos_probs = rearrange(pos_probs_expanded, 'b 1 -> b')
+                
+                eov_probs = student_probs_flat[:, self.eov_id]                            
+                neg_probs = student_probs_flat.gather(1, padded_negs)                     
+                
+                # constrastive loss
+                neg_probs_sum = (neg_probs * valid_neg_mask).sum(dim=1) 
+                denom = pos_probs + neg_probs_sum
+                contrastive_loss = -torch.log(pos_probs / (denom + 1e-8))
+                
+                # diversity loss
+                term1 = F.relu(eov_probs - pos_probs)
+                
+                eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
+                term2_raw = F.relu(neg_probs - eov_probs_expanded)
+                
+                term2_sum = (term2_raw * valid_neg_mask).sum(dim=1)
+                num_valid = valid_neg_mask.sum(dim=1).clamp(min=1) 
+                eov_loss = term1 + (term2_sum / num_valid)
+                
+             
+                mera_loss_step = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
+                
+                mera_loss_step = mera_loss_step * mera_active_mask.float()
+                
+                mera_loss_step_expanded = rearrange(mera_loss_step, 'b -> b 1')
+                combined_loss = combined_loss + mera_loss_step_expanded
+
 
             # final loss
             total_step_losses = safe_cat((total_step_losses, combined_loss), dim = 1)
