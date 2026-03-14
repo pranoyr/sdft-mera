@@ -3,27 +3,38 @@ from transformers import AutoTokenizer
 import torch
 from torch.utils.data import Dataset
 from x_transformers import TransformerWrapper, Decoder 
-from sdft_pytorch import SDFTTrainer
+from sdft_pytorch.sdft_mera import  SDFTMERATrainer
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
+from torch.utils.data import Dataset
+import torch
 
-class DummyScienceDataset(Dataset):
+class DummyICD10ContrastiveDataset(Dataset):
     def __init__(self, num_samples=100):
-        """
-        Creates an in-memory dataset with dummy questions and expert reasoning.
-        We multiply a few base examples to simulate a larger dataset for testing.
-        """
+
         base_data = [
             {
-                "question": "If you drop a solid iron ball and a solid wooden ball of the same size from a building at the same time, which hits the ground first? (Ignore air resistance)", 
-                "answer": "According to Galileo's principle of equivalence, objects in a vacuum fall at the same rate regardless of their mass. Since we are ignoring air resistance, both the iron ball and the wooden ball will experience the same gravitational acceleration (9.8 m/s^2 on Earth). Therefore, they will hit the ground at the exact same time."
+                "question": "Visit 1: E10.65 (Type 1 diabetes with hyperglycemia). Patient presents today with uncontrolled blood sugar despite insulin adherence.", 
+                "answer": "E10.65 <EOV>", 
+                "hard_negatives": [
+                    "E11.65",
+                    "E10.9"   
+                ]
             },
             {
-                "question": "Is pure water (H2O) considered an element or a compound?", 
-                "answer": "An element is a pure substance consisting of only one type of atom. A compound is a substance formed when two or more chemical elements are chemically bonded together. Water is made of two Hydrogen atoms and one Oxygen atom bonded together. Therefore, water is a compound."
+                "question": "Visit 1: J45.909 (Unspecified asthma). Visit 2: J45.901 (Asthma with acute exacerbation). Patient presents for routine follow-up, breathing is normal today.", 
+                "answer": "J45.909 <EOV>", 
+                "hard_negatives": [
+                    "J45.901", 
+                    "J44.9"   
+                ]
             },
             {
-                "question": "Why does ice float on liquid water?", 
-                "answer": "For most substances, the solid phase is denser than the liquid phase. However, when water freezes, its molecules form a crystalline structure held together by hydrogen bonds, which spaces the molecules further apart. Because the molecules are further apart, ice is less dense than liquid water, causing it to float."
+                "question": "Visit 1: I10 (Essential hypertension). Blood pressure today is 145/90. No secondary causes identified. Continuing Lisinopril.", 
+                "answer": "I10 <EOV>", 
+                "hard_negatives": [
+                    "I15.9",
+                    "I11.9"  
+                ]
             }
         ]
         
@@ -36,12 +47,15 @@ class DummyScienceDataset(Dataset):
         
     def __getitem__(self, idx):
         item = self.samples[idx]
-        return item['question'], item['answer']
+        return item['question'], item['answer'], item['hard_negatives']
 
 
-train_dataset = DummyScienceDataset(num_samples=100)
 
-tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-7B-Instruct")
+train_dataset = DummyICD10ContrastiveDataset(num_samples=100)
+
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+
+tokenizer = AutoTokenizer.from_pretrained(model_name)
 
 def encode_prompt_to_tensor(prompt_string: str) -> torch.Tensor:
     """
@@ -51,7 +65,7 @@ def encode_prompt_to_tensor(prompt_string: str) -> torch.Tensor:
     return token_dict['input_ids'].squeeze(0)
 
 
-model_name = "Qwen/Qwen2.5-7B-Instruct"
+
 
 config = AutoConfig.from_pretrained(model_name)
 config.attention_dropout = 0.0
@@ -65,7 +79,7 @@ base_model = AutoModelForCausalLM.from_pretrained(
 )
 
 # trainer
-trainer = SDFTTrainer(
+trainer = SDFTMERATrainer(
     model = base_model,
     dataset = train_dataset,
     tokenizer_encode = encode_prompt_to_tensor, 
