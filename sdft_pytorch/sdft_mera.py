@@ -236,7 +236,7 @@ class SDFTMERA(Module):
             # apply MERA if hard neg are provided
             if neg_ids_list is not None:
                 mera_loss_step = torch.zeros(batch_size, device=device)
-                student_probs_flat = rearrange(student_token_probs, 'b 1 d -> b d')
+                student_probs_flat = rearrange(student_token_probs, 'b 1 c -> b c')
                 
                 for b in range(batch_size):
                    
