@@ -79,13 +79,17 @@ class SDFTMERA(Module):
         student_max_response_len,
         student_prompt_template = DEFAULT_STUDENT_PROMPT_TEMPLATE,
         teacher_update_rate = 0.01,
+        training_stage = "sdft-mera",
         teacher_prompt_template = DEFAULT_TEACHER_PROMPT_TEMPLATE,
         num_init_student_response_tokens_mask = 0,  # they mentioned some issue where the student starts repeating stuff in the prompt template, where they alleviate by masking out the loss for first few tokens
         eos_id = None, # if set, will mask out any losses after the first eos token id detected in a given sample
 
-        eov_id = None,            # ID of the <EOV> token
-        mera_alpha = 0.1,         # Scaling weight for the Contrastive Loss
-        mera_beta = 0.1  
+        eov_id = None,            
+        icd_vocab_ids = None,
+        mera_contrastive_weight = 0.0,
+        mera_diversity_weight = 0.0,
+        sdft_loss_kl_weight = 0.0
+
     ):
         super().__init__()
 
@@ -100,9 +104,12 @@ class SDFTMERA(Module):
             include_online_model = False
         )
 
+
+        self.training_stage = training_stage
+
         # sampling
 
-        self.icd_vocab_ids = set(range(8334, 8369))  # Assuming ICD-10 codes are in this range
+        self.icd_vocab_ids = icd_vocab_ids
 
         self.student_max_response_len = student_max_response_len
 
@@ -128,10 +135,12 @@ class SDFTMERA(Module):
 
         self.num_init_student_response_tokens_mask = num_init_student_response_tokens_mask
 
+        if self.training_stage == "sdft":
+            self.mera_contrastive_weight = 0.0
+            self.mera_diversity_weight = 0.0
+        if self.training_stage == "mera":
+            self.sdft_loss_kl_weight = 0.0
 
-        self.eov_id = eov_id
-        self.mera_alpha = mera_alpha
-        self.mera_beta = mera_beta
 
     def parameters(self):
         return self.student.parameters()
@@ -154,7 +163,7 @@ class SDFTMERA(Module):
         encode = self.tokenizer_encode
 
         neg_ids_list = None
-        if exists(hard_negatives):
+        if "mera" in self.training_stage:
             neg_ids_list = []
             for negs in hard_negatives:
                 # encode(n) returns a 1D tensor like tensor([8334, 12, ...])
@@ -231,10 +240,11 @@ class SDFTMERA(Module):
 
             ).sum(dim = -1)
 
-            combined_loss = token_kl_div
+            combined_loss = token_kl_div * self.sdft_loss_kl_weight
 
             # apply MERA if hard neg are provided
-            if neg_ids_list is not None:
+            # if training stage contains word mera
+            if "mera" in self.training_stage:
                 mera_loss_step = torch.zeros(batch_size, device=device)
                 student_probs_flat = rearrange(student_token_probs, 'b 1 c -> b c')
                 
@@ -255,7 +265,7 @@ class SDFTMERA(Module):
                         # Dynamic EOV Loss
                         eov_loss = F.relu(eov_prob - pos_prob) + F.relu(neg_probs - eov_prob).mean()
                         
-                        mera_loss_step[b] = (self.mera_alpha * contrastive_loss) + (self.mera_beta * eov_loss)
+                        mera_loss_step[b] = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
                         
                     else:
                         mera_loss_step[b] = 0.0
