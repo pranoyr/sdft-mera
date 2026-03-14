@@ -135,6 +135,12 @@ class SDFTMERA(Module):
 
         self.num_init_student_response_tokens_mask = num_init_student_response_tokens_mask
 
+        self.eov_id = eov_id
+        self.mera_contrastive_weight = mera_contrastive_weight
+        self.mera_diversity_weight = mera_diversity_weight
+        self.sdft_loss_kl_weight = sdft_loss_kl_weight
+
+
         if self.training_stage == "sdft":
             self.mera_contrastive_weight = 0.0
             self.mera_diversity_weight = 0.0
