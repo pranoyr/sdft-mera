@@ -290,7 +290,6 @@ class SDFTTrainer(Module):
         self.model.train()
 
         for epoch in range(num_epochs):
-            print(f"Starting Epoch {epoch + 1}/{num_epochs}...")
 
             for questions, answers in self.dataloader:
                 with self.accelerator.accumulate(self.model):
@@ -303,6 +302,9 @@ class SDFTTrainer(Module):
 
                     self.optimizer.step()
                     self.optimizer.zero_grad()
+
+                    if self.accelerator.is_main_process:
+                        print(f"Epoch {epoch} Loss: {output.loss.item()}")
 
                     if self.accelerator.sync_gradients:
                         self.model.update_teacher_ema_()
