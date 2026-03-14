@@ -168,16 +168,6 @@ class SDFTMERA(Module):
 
         encode = self.tokenizer_encode
 
-        # neg_ids_list = None
-        # if "mera" in self.training_stage:
-            # neg_ids_list = []
-            # for negs in hard_negatives:
-            #     # encode(n) returns a 1D tensor like tensor([8334, 12, ...])
-            #     # [0] gets the first token, .item() turns it into a plain integer
-            #     n_ids = [encode(n)[0].item() for n in negs]
-            #     neg_ids_list.append(n_ids)
-
-        # --- PRE-PROCESS HARD NEGATIVES FOR VECTORIZATION ---
         padded_negs = None
         valid_neg_mask = None
         
