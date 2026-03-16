@@ -108,7 +108,7 @@ trainer = SDFTMERATrainer(
     sdft_kwargs = {
         "student_max_response_len": 128,  # Max tokens the model will generate per step
         "eos_id": tokenizer.eos_token_id,           # Stops loss calculation after this token
-        "num_init_student_response_tokens_mask": 4 ,
+        "num_init_student_response_tokens_mask": 0 ,
         "eov_id": eov_token_id,         
         "icd_vocab_ids": icd_token_ids,
         "sdft_loss_kl_weight": 1.0,
@@ -117,47 +117,47 @@ trainer = SDFTMERATrainer(
 )
 
 
-# # mera only
+# mera only
 
-# trainer = SDFTMERATrainer(
-#     model = base_model,
-#     dataset = train_dataset,
-#     tokenizer_encode = encode_prompt_to_tensor, 
-#     batch_size = 2,
-#     learning_rate = 2e-5,
-#     sdft_kwargs = {
-#         "student_max_response_len": 128,  # Max tokens the model will generate per step
-#         "eos_id": tokenizer.eos_token_id,           # Stops loss calculation after this token
-#         "num_init_student_response_tokens_mask": 4 ,
-#         "eov_id": eov_token_id,         
-#         "icd_vocab_ids": icd_token_ids,
-#         "mera_contrastive_weight": 1.0,
-#         "mera_diversity_weight": 0.2,
-#         "training_stage": "mera"
-#     }
-# )
+trainer = SDFTMERATrainer(
+    model = base_model,
+    dataset = train_dataset,
+    tokenizer_encode = encode_prompt_to_tensor, 
+    batch_size = 2,
+    learning_rate = 2e-5,
+    sdft_kwargs = {
+        "student_max_response_len": 128,  # Max tokens the model will generate per step
+        "eos_id": tokenizer.eos_token_id,           # Stops loss calculation after this token
+        "num_init_student_response_tokens_mask": 0 ,
+        "eov_id": eov_token_id,         
+        "icd_vocab_ids": icd_token_ids,
+        "mera_contrastive_weight": 1.0,
+        "mera_diversity_weight": 0.2,
+        "training_stage": "mera"
+    }
+)
 
 
-# # sdft + mera
+# sdft + mera
 
-# trainer = SDFTMERATrainer(
-#     model = base_model,
-#     dataset = train_dataset,
-#     tokenizer_encode = encode_prompt_to_tensor, 
-#     batch_size = 2,
-#     learning_rate = 2e-5,
-#     sdft_kwargs = {
-#         "student_max_response_len": 128,  # Max tokens the model will generate per step
-#         "eos_id": tokenizer.eos_token_id,           # Stops loss calculation after this token
-#         "num_init_student_response_tokens_mask": 4 ,
-#         "eov_id": eov_token_id,         
-#         "icd_vocab_ids": icd_token_ids,
-#         "mera_contrastive_weight": 0.1,
-#         "mera_diversity_weight": 0.05,
-#         "sdft_loss_kl_weight": 1,
-#         "training_stage": "sdft+mera"
-#     }
-# )
+trainer = SDFTMERATrainer(
+    model = base_model,
+    dataset = train_dataset,
+    tokenizer_encode = encode_prompt_to_tensor, 
+    batch_size = 2,
+    learning_rate = 2e-5,
+    sdft_kwargs = {
+        "student_max_response_len": 128,  # Max tokens the model will generate per step
+        "eos_id": tokenizer.eos_token_id,           # Stops loss calculation after this token
+        "num_init_student_response_tokens_mask": 0 ,
+        "eov_id": eov_token_id,         
+        "icd_vocab_ids": icd_token_ids,
+        "mera_contrastive_weight": 0.1,
+        "mera_diversity_weight": 0.05,
+        "sdft_loss_kl_weight": 1,
+        "training_stage": "sdft+mera"
+    }
+)
 
 
 
