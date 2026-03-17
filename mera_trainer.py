@@ -7,7 +7,7 @@ from sdft_pytorch import MERATrainer
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoConfig
 from torch.utils.data import Dataset
 import torch
-from negative_mining import extract_icd_codes, build_hard_negative_lookup
+from negative_mining import extract_icd_tokens, build_hard_negative_lookup
 import random
 import json
 
@@ -35,7 +35,7 @@ def encode_prompt_to_tensor(prompt_string: str) -> torch.Tensor:
 with open('icd10cm.json', 'r') as f:
     icd_data = json.load(f)
 
-icd_special_tokens = extract_icd_codes(icd_data, format_as_special_token=True)
+icd_special_tokens = extract_icd_tokens(icd_data, format_as_special_token=True)
 negatives_lookup = build_hard_negative_lookup(icd_data, format_as_special_token=True)
 
 special_tokens_dict = {'additional_special_tokens': ['<EOV>'] + icd_special_tokens}
