@@ -246,15 +246,18 @@ class SDFTMERA(Module):
             student_token_logit = student_logits[:, -1:]
             teacher_token_logit = teacher_logits[:, -1:]
 
-            student_token_probs = student_token_logit.softmax(dim = -1)
+            student_token_probs = student_token_logit.log_softmax(dim = -1)
             teacher_token_log_probs = teacher_token_logit.log_softmax(dim = -1)
+
+            student_standard_probs = student_token_logit.softmax(dim = -1)
 
             # privileged self distillation via ICL
 
             token_kl_div = F.kl_div(
-                teacher_token_log_probs,
                 student_token_probs,
-                reduction = 'none'
+                teacher_token_log_probs,
+                reduction = 'none',
+                log_target=True
 
             ).sum(dim = -1)
 
@@ -262,7 +265,7 @@ class SDFTMERA(Module):
 
          
             if "mera" in self.training_stage:
-                student_probs_flat = rearrange(student_token_probs, 'b 1 c -> b c')
+                student_probs_flat = rearrange(student_standard_probs, 'b 1 c -> b c')
                 
                 # teachers prds
                 teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
@@ -283,7 +286,8 @@ class SDFTMERA(Module):
                 # constrastive loss
                 neg_probs_sum = (neg_probs * valid_neg_mask).sum(dim=1) 
                 denom = pos_probs + neg_probs_sum
-                contrastive_loss = -torch.log(pos_probs / (denom + 1e-8))
+                fraction = pos_probs / (denom + 1e-8)
+                contrastive_loss = -torch.log(fraction.clamp(min=1e-8))
                 
                 # diversity loss
                 term1 = F.relu(eov_probs - pos_probs)
@@ -394,8 +398,7 @@ class SDFTMERATrainer(Module):
         self.model.train()
 
         for epoch in range(num_epochs):
-            print(f"Starting Epoch {epoch + 1}/{num_epochs}...")
-
+       
             for questions, answers, hard_negatives in self.dataloader:
                 with self.accelerator.accumulate(self.model):
                     output = self.model(questions, answers, hard_negatives)
@@ -404,6 +407,9 @@ class SDFTMERATrainer(Module):
 
                     if exists(self.max_grad_norm) and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+
+                    if self.accelerator.is_main_process:
+                        print(f"Epoch {epoch} Loss: {output.loss.item()}")
 
                     self.optimizer.step()
                     self.optimizer.zero_grad()

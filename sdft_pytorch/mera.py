@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Callable
+from typing import Callable, List, Tuple
 from collections import namedtuple
 
 from jinja2 import Template, Environment, meta
@@ -9,350 +9,216 @@ from torch.optim import Adam
 from torch.nn import Module
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from torch import nn, cat, stack, is_tensor, tensor, Tensor
+from torch import tensor, is_tensor, Tensor
 
 from accelerate import Accelerator
+from einops import rearrange, repeat
 
-from einops import rearrange
 
-from torch_einops_utils import (
-    pad_sequence,
-    safe_cat,
-    masked_mean,
-    and_masks
-)
-
-from ema_pytorch import EMA
-
-from x_transformers import TransformerWrapper
-
-from discrete_continuous_embed_readout import Readout
-
-# default query / demonstration template for in-context learned distillation targets from teacher for student
-
-DEFAULT_STUDENT_PROMPT_TEMPLATE = """
+DEFAULT_PROMPT_TEMPLATE = """
 [Instruction]
-You are a helpful assistant
+You are a helpful assistant predicting clinical diagnoses.
 
-[Query]
+[Patient History]
 {{ question }}
 
-[Response]
-"""
-
-DEFAULT_TEACHER_PROMPT_TEMPLATE = """
-[Task Instructions] You are a helpful assistant. Please answer the question based on the provided logic.
-
-[Expert Demonstration] Question: {{ question }} Expert Reasoning and Answer: {{ answer }}
-
-[Current Task] Question: {{ question }} Answer:
+[ICD Code Prediction]
 """
 
 def get_variables_from_template(template):
-
     env = Environment()
-
     parsed_template = env.parse(template)
-
     return set(meta.find_undeclared_variables(parsed_template))
-
-# helpers
 
 def exists(v):
     return v is not None
 
-def default(v, d):
-    return v if exists(v) else d
+MERAOutput = namedtuple('MERAOutput', ('loss', 'logits'))
 
-def maybe_cast_tensor(t):
-    return t if is_tensor(t) else tensor(t)
 
-# classes
 
-SDFTOutput = namedtuple('SDFTOutput', ('loss', 'response'))
-
-class SDFTMERA(Module):
+class MERA(Module):
     def __init__(
         self,
-        model: TransformerWrapper,
-        tokenizer_encode: Callable[[list[str]], list[Tensor]],
-        student_max_response_len,
-        student_prompt_template = DEFAULT_STUDENT_PROMPT_TEMPLATE,
-        teacher_update_rate = 0.01,
-        training_stage = "sdft-mera",
-        teacher_prompt_template = DEFAULT_TEACHER_PROMPT_TEMPLATE,
-        num_init_student_response_tokens_mask = 0,  # they mentioned some issue where the student starts repeating stuff in the prompt template, where they alleviate by masking out the loss for first few tokens
-        eos_id = None, # if set, will mask out any losses after the first eos token id detected in a given sample
-
-        eov_id = None,            
-        icd_vocab_ids = None,
-        mera_contrastive_weight = 0.0,
-        mera_diversity_weight = 0.0,
-        sdft_loss_kl_weight = 0.0
-
+        model: Module,
+        tokenizer_encode: Callable,
+        prompt_template = DEFAULT_PROMPT_TEMPLATE,
+        eov_id: int = None,
+        icd_vocab_ids: list[int] = None,
+        mera_contrastive_weight: float = 1.0,
+        mera_diversity_weight: float = 1.0,
     ):
         super().__init__()
 
-        if isinstance(model, TransformerWrapper):
-            model.input_not_include_cache = True
-
-        self.student = model
-
-        self.teacher = EMA(
-            model,
-            beta = 1. - teacher_update_rate,
-            include_online_model = False
-        )
-
-
-        self.training_stage = training_stage
-
-        # sampling
-
-        self.icd_vocab_ids = icd_vocab_ids
-
-        self.student_max_response_len = student_max_response_len
-
-        self.discrete_readout = Readout(dim = 0, num_discrete = 1)
-
-        # collection of prompts to list[Int['seq']]
-
+        self.model = model
         self.tokenizer_encode = tokenizer_encode
 
-        # store templates
-
-        assert get_variables_from_template(teacher_prompt_template) == {'question', 'answer'}, 'your template must contain only variables `question` and `answer`, embedded like so - {{ question }} ... {{ answer }}'
-        self.teacher_prompt_template = Template(teacher_prompt_template)
-
-        assert get_variables_from_template(student_prompt_template) == {'question'}
-        self.student_prompt_template = Template(student_prompt_template)
-
-        # end of string
-
-        self.eos_id = eos_id
-
-        # how many initial response tokens to exclude from reverse kl loss
-
-        self.num_init_student_response_tokens_mask = num_init_student_response_tokens_mask
+        assert get_variables_from_template(prompt_template) == {'question'}
+        self.prompt_template = Template(prompt_template)
 
         self.eov_id = eov_id
+        self.icd_vocab_ids = icd_vocab_ids
+        
         self.mera_contrastive_weight = mera_contrastive_weight
         self.mera_diversity_weight = mera_diversity_weight
-        self.sdft_loss_kl_weight = sdft_loss_kl_weight
 
-
-        if self.training_stage == "sdft":
-            self.mera_contrastive_weight = 0.0
-            self.mera_diversity_weight = 0.0
-        if self.training_stage == "mera":
-            self.sdft_loss_kl_weight = 0.0
-
+        if exists(self.icd_vocab_ids) and exists(self.eov_id):
+            self.target_vocab_tensor = torch.tensor(list(self.icd_vocab_ids) + [self.eov_id])
+        else:
+            self.target_vocab_tensor = None
 
     def parameters(self):
-        return self.student.parameters()
-
-    def update_teacher_ema_(self):
-        self.teacher.update()
+        return self.model.parameters()
 
     def forward(
         self,
         questions: list[str],
         answers: list[str],
         hard_negatives: list[list[str]] = None,
-        student_logit_sample_kwargs: dict = dict(),
-    
     ):
-        maybe_eos_id, prefix_mask_len = self.eos_id, self.num_init_student_response_tokens_mask
-
+        device = next(self.parameters()).device
         batch_size = len(questions)
-
         encode = self.tokenizer_encode
 
-        padded_negs = None
-        valid_neg_mask = None
+    
+        prompts_vars = [{'question': question} for question in questions]
+        prompts_str = [self.prompt_template.render(prompt) for prompt in prompts_vars]
+
+    
+        encoded_inputs = encode(prompts_str)
+        input_ids = encoded_inputs['input_ids'].to(device)
+
+        attention_mask = encoded_inputs['attention_mask'].to(device)
+
+      
+        outputs = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
         
-        if "mera" in self.training_stage and exists(hard_negatives):
-            device = next(self.parameters()).device
-            
-            max_negs = max(len(negs) for negs in hard_negatives)
-            
-            padded_negs = torch.zeros((batch_size, max_negs), dtype=torch.long, device=device)
-            valid_neg_mask = torch.zeros((batch_size, max_negs), dtype=torch.bool, device=device)
-            
-            for b, negs in enumerate(hard_negatives):
-                # Encode strings to IDs
-                n_ids = [encode(n)[0].item() for n in negs]
-                
-                padded_negs[b, :len(n_ids)] = torch.tensor(n_ids, device=device)
-                
-                valid_neg_mask[b, :len(n_ids)] = True
-                
-            self.target_vocab_tensor = torch.tensor(list(self.icd_vocab_ids) + [self.eov_id], device=device)
+        # last token
+        next_token_logits = outputs.logits[:, -1, :] 
+        probs = next_token_logits.softmax(dim=-1)
+        vocab_size = next_token_logits.shape[-1]
 
+       
+        pos_mask = torch.zeros((batch_size, vocab_size), dtype=torch.bool, device=device)
+        neg_mask = torch.zeros((batch_size, vocab_size), dtype=torch.bool, device=device)
+
+    
+        # ans_encoded = encode(answers)['input_ids'].to(device)
+        # pos_mask.scatter_(1, ans_encoded, True) 
+
+        pos_counts = torch.tensor([len(a) for a in answers], device=device)
+        max_pos = pos_counts.max().item()
         
-        assert len(questions) == len(answers)
-
-        student_vars = [{'question': question} for question in questions]
-        teacher_vars = [{'question': question, 'answer': answer} for question, answer in zip(questions, answers)]
-
-        # ready the prompts for student and teacher
-
-        student_prompts_str = [self.student_prompt_template.render(questions) for questions in student_vars]
-        teacher_prompts_str = [self.teacher_prompt_template.render(question_answers) for question_answers in teacher_vars]
-
-        student_prompt_ids = [maybe_cast_tensor(encode(prompt)) for prompt in student_prompts_str]
-        teacher_prompt_ids = [maybe_cast_tensor(encode(prompt)) for prompt in teacher_prompts_str]
-
-        student_prompt_ids, student_seq_start_pos = pad_sequence(student_prompt_ids, return_lens = True, left = True, pad_lens = True)
-        teacher_prompt_ids, teacher_seq_start_pos = pad_sequence(teacher_prompt_ids, return_lens = True, left = True, pad_lens = True)
-
-        device = next(self.parameters()).device
-        student_prompt_ids = student_prompt_ids.to(device)
-        teacher_prompt_ids = teacher_prompt_ids.to(device)
+        if max_pos > 0:
+   
+            pos_flat = [ans for ans_list in answers for ans in ans_list]
+            pos_encoded = encode(pos_flat)['input_ids'].to(device)
+            
         
-        if is_tensor(student_seq_start_pos):
-            student_seq_start_pos = student_seq_start_pos.to(device)
-        if is_tensor(teacher_seq_start_pos):
-            teacher_seq_start_pos = teacher_seq_start_pos.to(device)
-
-        student_cache = None
-        teacher_cache = None
-
-        # accumulate
-
-        student_responses = None
-        token_kl_div_losses = None
-        total_step_losses = None
-
-        for _ in range(self.student_max_response_len):
-
-            # forward for logit of student and teacher
-
-            # student_logits, student_cache = self.student(student_prompt_ids, cache = student_cache, seq_start_pos = student_seq_start_pos, return_intermediates = True)
-            outputs = self.student(student_prompt_ids, cache = student_cache, seq_start_pos = student_seq_start_pos, return_intermediates = True)
-
-
-            student_logits = outputs.logits
-            student_cache = outputs.past_key_values
-
-
-            with torch.no_grad():
-                self.teacher.eval()
-                outputs = self.teacher(teacher_prompt_ids, cache = teacher_cache, seq_start_pos = teacher_seq_start_pos, return_intermediates = True)
-
-            teacher_logits = outputs.logits
-            teacher_cache = outputs.past_key_values
-
-            student_token_logit = student_logits[:, -1:]
-            teacher_token_logit = teacher_logits[:, -1:]
-
-            student_token_probs = student_token_logit.softmax(dim = -1)
-            teacher_token_log_probs = teacher_token_logit.log_softmax(dim = -1)
-
-            # privileged self distillation via ICL
-
-            token_kl_div = F.kl_div(
-                teacher_token_log_probs,
-                student_token_probs,
-                reduction = 'none'
-
-            ).sum(dim = -1)
-
-            combined_loss = token_kl_div * self.sdft_loss_kl_weight
+            batch_ids = torch.arange(batch_size, device=device)
+            batch_grid = repeat(batch_ids, 'b -> b l', l=max_pos)
+            
+            pos_idx = torch.arange(max_pos, device=device)
+            pos_grid = repeat(pos_idx, 'l -> b l', b=batch_size)
+            counts_grid = repeat(pos_counts, 'b -> b l', l=max_pos)
 
          
-            if "mera" in self.training_stage:
-                student_probs_flat = rearrange(student_token_probs, 'b 1 c -> b c')
+            valid_mask = pos_grid < counts_grid
+            b_idx_tensor = batch_grid[valid_mask]  
+            
+            b_idx_grid = rearrange(b_idx_tensor, 'n -> n 1').expand_as(pos_encoded)
+            pos_mask[b_idx_grid, pos_encoded] = True
+
+
+
+        if exists(hard_negatives):
+         
+            neg_counts = torch.tensor([len(n) for n in hard_negatives], device=device)
+            max_negs = neg_counts.max().item()
+            
+            if max_negs > 0:
+                neg_flat = [neg for neg_list in hard_negatives for neg in neg_list]
+                neg_encoded = encode(neg_flat)['input_ids'].to(device) 
                 
-                # teachers prds
-                teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
-
-                pos_ids  = teacher_pos_ids
+                batch_ids = torch.arange(batch_size, device=device)
+                batch_grid = repeat(batch_ids, 'b -> b l', l=max_negs)
                 
-                # mask to ignore non ICD and EOv
-                mera_active_mask = torch.isin(teacher_pos_ids, self.target_vocab_tensor) 
+                pos = torch.arange(max_negs, device=device)
+                pos_grid = repeat(pos, 'l -> b l', b=batch_size)
+                counts_grid = repeat(neg_counts, 'b -> b l', l=max_negs)
+
+                valid_mask = pos_grid < counts_grid
+                b_idx_tensor = batch_grid[valid_mask]  
+
                 
-      
-                pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
-                pos_probs_expanded = student_probs_flat.gather(1, pos_ids_expanded) 
-                pos_probs = rearrange(pos_probs_expanded, 'b 1 -> b')
-                
-                eov_probs = student_probs_flat[:, self.eov_id]                            
-                neg_probs = student_probs_flat.gather(1, padded_negs)                     
-                
-                # constrastive loss
-                neg_probs_sum = (neg_probs * valid_neg_mask).sum(dim=1) 
-                denom = pos_probs + neg_probs_sum
-                contrastive_loss = -torch.log(pos_probs / (denom + 1e-8))
-                
-                # diversity loss
-                term1 = F.relu(eov_probs - pos_probs)
-                
-                eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
-                term2_raw = F.relu(neg_probs - eov_probs_expanded)
-                
-                term2_sum = (term2_raw * valid_neg_mask).sum(dim=1)
-                num_valid = valid_neg_mask.sum(dim=1).clamp(min=1) 
-                eov_loss = term1 + (term2_sum / num_valid)
-                
-             
-                mera_loss_step = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
-                
-                mera_loss_step = mera_loss_step * mera_active_mask.float()
-                
-                mera_loss_step_expanded = rearrange(mera_loss_step, 'b -> b 1')
-                combined_loss = combined_loss + mera_loss_step_expanded
+                b_idx_grid = rearrange(b_idx_tensor, 'n -> n 1').expand_as(neg_encoded)
+                neg_mask[b_idx_grid, neg_encoded] = True
 
 
-            # final loss
-            total_step_losses = safe_cat((total_step_losses, combined_loss), dim = 1)
+        pad_id = self.model.config.pad_token_id
+        if pad_id is not None:
+            pos_mask[:, pad_id] = False
+            neg_mask[:, pad_id] = False
 
-            # sample
 
-            sampled_action = self.discrete_readout.sample(student_token_logit, **student_logit_sample_kwargs)
+        pos_mask_f = pos_mask.to(probs.dtype)
+        neg_mask_f = neg_mask.to(probs.dtype)
 
-            student_responses = safe_cat((student_responses, sampled_action), dim = 1)
+        # Contrastive Loss
+        sum_pos_probs = torch.einsum('b v, b v -> b', probs, pos_mask_f)
+        sum_neg_probs = torch.einsum('b v, b v -> b', probs, neg_mask_f)
 
-            # break if all eos
+        denom = sum_pos_probs + sum_neg_probs + 1e-8
+        contrastive_loss = -torch.log((sum_pos_probs + 1e-8) / denom).mean()
 
-            if exists(maybe_eos_id) and (student_responses == maybe_eos_id).any(dim = -1).all():
-                break
+        # Dynamic Confidence Threshold Loss 
+        dce_loss = torch.tensor(0.0, device=device, dtype=probs.dtype)
+        if exists(self.eov_id):
+            eov_probs = probs[:, self.eov_id] # (b,)
+            eov_probs_grid = rearrange(eov_probs, 'b -> b 1') 
 
-            # set student and teacher tokens to the next sampled token
+            pos_diff = F.relu(eov_probs_grid - probs)
+            term1 = torch.einsum('b v, b v -> b', pos_diff, pos_mask_f)
 
-            student_prompt_ids = sampled_action
-            teacher_prompt_ids = sampled_action
+            neg_diff = F.relu(probs - eov_probs_grid)
+            term2 = torch.einsum('b v, b v -> b', neg_diff, neg_mask_f)
 
-        # handle eos
+            num_neg = neg_mask_f.sum(dim=-1).clamp(min=1)
+            term2_mean = term2 / num_neg
 
-        eos_mask = None
+            dce_loss = (term1 + term2_mean).mean()
 
-        if exists(maybe_eos_id):
-            eos_mask = (student_responses == maybe_eos_id).cumsum(dim = -1) == 0
+    
+        loss = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * dce_loss)
 
-            eos_mask = F.pad(eos_mask, (1, -1), value = True)
+        # # 7. Vectorized Predictions
+        # predictions = []
+        # if exists(self.eov_id):
+        #     eov_probs_grid = rearrange(probs[:, self.eov_id], 'b -> b 1')
+        #     pred_mask = probs > eov_probs_grid # (b, v) boolean grid
+        #     pred_mask[:, self.eov_id] = False 
+            
+        #     # List comprehension is the fastest way to extract varying lengths from a 2D dense mask
+        #     predictions = [m.nonzero(as_tuple=True)[0].tolist() for m in pred_mask]
 
-            student_responses.masked_fill_(~eos_mask, -1)
+        return MERAOutput(loss=loss, logits=next_token_logits)
+    
 
-        # handle masking of first few response tokens
 
-        init_tokens_mask = None
-
-        if prefix_mask_len > 0:
-            init_tokens_mask = torch.ones_like(student_responses).bool()
-            init_tokens_mask[:, :prefix_mask_len] = False
-
-        # maybe masked mean for losses
-
-        mask = and_masks([eos_mask, init_tokens_mask])
-
-        loss = masked_mean(total_step_losses, mask)
-
-        return SDFTOutput(loss, student_responses)
 
 # trainer
 
-class SDFTMERATrainer(Module):
+def custom_collate(batch):
+    questions = [item[0] for item in batch]
+    answers = [item[1] for item in batch]
+    hard_negatives = [item[2] for item in batch]
+    return questions, answers, hard_negatives
+
+
+class MERATrainer(Module):
     def __init__(
         self,
         model: Module,
@@ -374,7 +240,7 @@ class SDFTMERATrainer(Module):
             **accelerate_kwargs
         )
 
-        self.model = SDFTMERA(
+        self.model = MERA(
             model,
             tokenizer_encode = tokenizer_encode,
             **sdft_kwargs
@@ -382,7 +248,7 @@ class SDFTMERATrainer(Module):
 
         self.optimizer = optim_klass(self.model.parameters(), lr = learning_rate, **optim_kwargs)
 
-        self.dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True)
+        self.dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = True, collate_fn=custom_collate)
 
         self.model, self.optimizer, self.dataloader = self.accelerator.prepare(
             self.model, self.optimizer, self.dataloader
@@ -394,8 +260,7 @@ class SDFTMERATrainer(Module):
         self.model.train()
 
         for epoch in range(num_epochs):
-            print(f"Starting Epoch {epoch + 1}/{num_epochs}...")
-
+       
             for questions, answers, hard_negatives in self.dataloader:
                 with self.accelerator.accumulate(self.model):
                     output = self.model(questions, answers, hard_negatives)
@@ -405,10 +270,12 @@ class SDFTMERATrainer(Module):
                     if exists(self.max_grad_norm) and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
+                    if self.accelerator.is_main_process:
+                        print(f"Epoch {epoch} Loss: {output.loss.item()}")
+
                     self.optimizer.step()
                     self.optimizer.zero_grad()
 
-                    if self.accelerator.sync_gradients:
-                        self.model.update_teacher_ema_()
+
 
         return output
