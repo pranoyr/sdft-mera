@@ -177,7 +177,7 @@ class MERA(Module):
         # Dynamic Confidence Threshold Loss 
         dce_loss = torch.tensor(0.0, device=device, dtype=probs.dtype)
         if exists(self.eov_id):
-            eov_probs = probs[:, self.eov_id] # (b,)
+            eov_probs = probs[:, self.eov_id] 
             eov_probs_grid = rearrange(eov_probs, 'b -> b 1') 
 
             pos_diff = F.relu(eov_probs_grid - probs)
@@ -271,7 +271,8 @@ class MERATrainer(Module):
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     if self.accelerator.is_main_process:
-                        print(f"Epoch {epoch} Loss: {output.loss.item()}")
+                        # print(f"Epoch {epoch} Loss: {output.loss.item()}")
+                        self.accelerator.log({"train_loss": output.loss.item()}, step=self.accelerator.get_step())
 
                     self.optimizer.step()
                     self.optimizer.zero_grad()
