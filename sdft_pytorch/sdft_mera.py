@@ -10,6 +10,8 @@ from torch.nn import Module
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from torch import nn, cat, stack, is_tensor, tensor, Tensor
+from einops import einsum
+
 
 from accelerate import Accelerator
 
@@ -224,6 +226,10 @@ class SDFTMERA(Module):
         token_kl_div_losses = None
         total_step_losses = None
 
+        all_student_probs = []
+        all_teacher_targets = []
+
+
         for _ in range(self.student_max_response_len):
 
             # forward for logit of student and teacher
@@ -249,7 +255,12 @@ class SDFTMERA(Module):
             student_token_probs = student_token_logit.log_softmax(dim = -1)
             teacher_token_log_probs = teacher_token_logit.log_softmax(dim = -1)
 
+            teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
+            # REFACTOR: Using rearrange instead of .unsqueeze(1)
+            all_teacher_targets.append(rearrange(teacher_pos_ids, 'b -> b 1'))
+
             student_standard_probs = student_token_logit.softmax(dim = -1)
+            all_student_probs.append(student_standard_probs)
 
             # privileged self distillation via ICL
 
@@ -264,50 +275,7 @@ class SDFTMERA(Module):
             combined_loss = token_kl_div * self.sdft_loss_kl_weight
 
          
-            if "mera" in self.training_stage:
-                student_probs_flat = rearrange(student_standard_probs, 'b 1 c -> b c')
-                
-                # teachers prds
-                teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
-
-                pos_ids  = teacher_pos_ids
-                
-                # mask to ignore non ICD and EOv
-                mera_active_mask = torch.isin(teacher_pos_ids, self.target_vocab_tensor) 
-                
-      
-                pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
-                pos_probs_expanded = student_probs_flat.gather(1, pos_ids_expanded) 
-                pos_probs = rearrange(pos_probs_expanded, 'b 1 -> b')
-                
-                eov_probs = student_probs_flat[:, self.eov_id]                            
-                neg_probs = student_probs_flat.gather(1, padded_negs)                     
-                
-                # constrastive loss
-                neg_probs_sum = (neg_probs * valid_neg_mask).sum(dim=1) 
-                denom = pos_probs + neg_probs_sum
-                fraction = pos_probs / (denom + 1e-8)
-                contrastive_loss = -torch.log(fraction.clamp(min=1e-8))
-                
-                # diversity loss
-                term1 = F.relu(eov_probs - pos_probs)
-                
-                eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
-                term2_raw = F.relu(neg_probs - eov_probs_expanded)
-                
-                term2_sum = (term2_raw * valid_neg_mask).sum(dim=1)
-                num_valid = valid_neg_mask.sum(dim=1).clamp(min=1) 
-                eov_loss = term1 + (term2_sum / num_valid)
-                
-             
-                mera_loss_step = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
-                
-                mera_loss_step = mera_loss_step * mera_active_mask.float()
-                
-                mera_loss_step_expanded = rearrange(mera_loss_step, 'b -> b 1')
-                combined_loss = combined_loss + mera_loss_step_expanded
-
-
+    
             # final loss
             total_step_losses = safe_cat((total_step_losses, combined_loss), dim = 1)
 
@@ -346,14 +314,72 @@ class SDFTMERA(Module):
             init_tokens_mask = torch.ones_like(student_responses).bool()
             init_tokens_mask[:, :prefix_mask_len] = False
 
-        # maybe masked mean for losses
 
-        mask = and_masks([eos_mask, init_tokens_mask])
 
-        loss = masked_mean(total_step_losses, mask)
+        if "mera" in self.training_stage:
+            
+            stacked_student_probs = torch.cat(all_student_probs, dim=1)     # (b, seq_len, vocab_size)
+            stacked_teacher_targets = torch.cat(all_teacher_targets, dim=1) # (b, seq_len)
 
-        return SDFTOutput(loss, student_responses)
+            class_mask = torch.isin(stacked_teacher_targets, self.target_vocab_tensor) # (b, seq_len)
+            valid_mera_batch_mask = class_mask.any(dim=1)                              # (b,)
+            
+            # Get the exact sequence index of the classification token
+            class_step_indices = class_mask.float().argmax(dim=1)                      # (b,)
+            
+            # get last token
+            b_indices = torch.arange(batch_size, device=device)
+            extracted_probs = stacked_student_probs[b_indices, class_step_indices]     # (b, vocab_size)
+            extracted_targets = stacked_teacher_targets[b_indices, class_step_indices] # (b,)
 
+
+            pos_ids = extracted_targets
+            
+            pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
+            pos_probs = rearrange(extracted_probs.gather(1, pos_ids_expanded), 'b 1 -> b')
+            
+            eov_probs = extracted_probs[:, self.eov_id]                            
+            neg_probs = extracted_probs.gather(1, padded_negs)                     
+            
+            neg_probs_sum = einsum(neg_probs, valid_neg_mask.float(), 'b n, b n -> b')
+            denom = pos_probs + neg_probs_sum
+            fraction = pos_probs / (denom + 1e-8)
+            contrastive_loss = -torch.log(fraction.clamp(min=1e-8))
+            
+            # Diversity loss
+            term1 = F.relu(eov_probs - pos_probs)
+            eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
+            term2_raw = F.relu(neg_probs - eov_probs_expanded)
+            
+            term2_sum = einsum(term2_raw, valid_neg_mask.float(), 'b n, b n -> b')
+            num_valid = einsum(valid_neg_mask.float(), 'b n -> b').clamp(min=1)
+            eov_loss = term1 + (term2_sum / num_valid)
+
+            
+            # MERA loss
+            mera_loss_batch = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
+            
+            # Zero out sequences that never reached the classification token
+            mera_loss_batch = mera_loss_batch * valid_mera_batch_mask.float()
+            valid_batch_count = valid_mera_batch_mask.float().sum().clamp(min=1)
+            mera_loss_scalar = mera_loss_batch.sum() / valid_batch_count
+
+            # MERA loss only on the last token 
+            reasoning_only_mask = ~class_mask 
+            mask = and_masks([eos_mask, init_tokens_mask, reasoning_only_mask])
+
+            sdft_loss_scalar = masked_mean(total_step_losses, mask)
+            
+            final_loss = sdft_loss_scalar + mera_loss_scalar
+
+        else:
+            # Standard SDFT applied to the entire valid sequence
+            mask = and_masks([eos_mask, init_tokens_mask])
+
+            final_loss = masked_mean(total_step_losses, mask)
+
+        return SDFTOutput(final_loss, student_responses)
+    
 # trainer
 
 class SDFTMERATrainer(Module):
