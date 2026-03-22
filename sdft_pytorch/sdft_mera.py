@@ -173,23 +173,22 @@ class SDFTMERA(Module):
         padded_negs = None
         valid_neg_mask = None
         
-        if "mera" in self.training_stage and exists(hard_negatives):
-            device = next(self.parameters()).device
+        device = next(self.parameters()).device
+        
+        max_negs = max(len(negs) for negs in hard_negatives)
+        
+        padded_negs = torch.zeros((batch_size, max_negs), dtype=torch.long, device=device)
+        valid_neg_mask = torch.zeros((batch_size, max_negs), dtype=torch.bool, device=device)
+        
+        for b, negs in enumerate(hard_negatives):
+            # Encode strings to IDs
+            n_ids = [encode(n)[0].item() for n in negs]
             
-            max_negs = max(len(negs) for negs in hard_negatives)
+            padded_negs[b, :len(n_ids)] = torch.tensor(n_ids, device=device)
             
-            padded_negs = torch.zeros((batch_size, max_negs), dtype=torch.long, device=device)
-            valid_neg_mask = torch.zeros((batch_size, max_negs), dtype=torch.bool, device=device)
+            valid_neg_mask[b, :len(n_ids)] = True
             
-            for b, negs in enumerate(hard_negatives):
-                # Encode strings to IDs
-                n_ids = [encode(n)[0].item() for n in negs]
-                
-                padded_negs[b, :len(n_ids)] = torch.tensor(n_ids, device=device)
-                
-                valid_neg_mask[b, :len(n_ids)] = True
-                
-            self.target_vocab_tensor = torch.tensor(list(self.icd_vocab_ids) + [self.eov_id], device=device)
+        self.target_vocab_tensor = torch.tensor(list(self.icd_vocab_ids) + [self.eov_id], device=device)
 
         
         assert len(questions) == len(answers)
@@ -256,7 +255,7 @@ class SDFTMERA(Module):
             teacher_token_log_probs = teacher_token_logit.log_softmax(dim = -1)
 
             teacher_pos_ids = teacher_token_logit[:, 0].argmax(dim=-1)
-            # REFACTOR: Using rearrange instead of .unsqueeze(1)
+      
             all_teacher_targets.append(rearrange(teacher_pos_ids, 'b -> b 1'))
 
             student_standard_probs = student_token_logit.softmax(dim = -1)
@@ -314,69 +313,63 @@ class SDFTMERA(Module):
             init_tokens_mask = torch.ones_like(student_responses).bool()
             init_tokens_mask[:, :prefix_mask_len] = False
 
+        
+        # MERA STAGE 
+
+        stacked_student_probs = torch.cat(all_student_probs, dim=1)     # (b, seq_len, vocab_size)
+        stacked_teacher_targets = torch.cat(all_teacher_targets, dim=1) # (b, seq_len)
+
+        class_mask = torch.isin(stacked_teacher_targets, self.target_vocab_tensor) # (b, seq_len)
+        valid_mera_batch_mask = class_mask.any(dim=1)                              # (b,)
+        
+        # Get the exact sequence index of the classification token
+        class_step_indices = class_mask.float().argmax(dim=1)                      # (b,)
+        
+        # get last token
+        b_indices = torch.arange(batch_size, device=device)
+        extracted_probs = stacked_student_probs[b_indices, class_step_indices]     # (b, vocab_size)
+        extracted_targets = stacked_teacher_targets[b_indices, class_step_indices] # (b,)
 
 
-        if "mera" in self.training_stage:
-            
-            stacked_student_probs = torch.cat(all_student_probs, dim=1)     # (b, seq_len, vocab_size)
-            stacked_teacher_targets = torch.cat(all_teacher_targets, dim=1) # (b, seq_len)
+        pos_ids = extracted_targets
+        
+        pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
+        pos_probs = rearrange(extracted_probs.gather(1, pos_ids_expanded), 'b 1 -> b')
+        
+        eov_probs = extracted_probs[:, self.eov_id]                            
+        neg_probs = extracted_probs.gather(1, padded_negs)                     
+        
+        neg_probs_sum = einsum(neg_probs, valid_neg_mask.float(), 'b n, b n -> b')
+        denom = pos_probs + neg_probs_sum
+        fraction = pos_probs / (denom + 1e-8)
+        contrastive_loss = -torch.log(fraction.clamp(min=1e-8))
+        
+        # Diversity loss
+        term1 = F.relu(eov_probs - pos_probs)
+        eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
+        term2_raw = F.relu(neg_probs - eov_probs_expanded)
+        
+        term2_sum = einsum(term2_raw, valid_neg_mask.float(), 'b n, b n -> b')
+        num_valid = einsum(valid_neg_mask.float(), 'b n -> b').clamp(min=1)
+        eov_loss = term1 + (term2_sum / num_valid)
 
-            class_mask = torch.isin(stacked_teacher_targets, self.target_vocab_tensor) # (b, seq_len)
-            valid_mera_batch_mask = class_mask.any(dim=1)                              # (b,)
-            
-            # Get the exact sequence index of the classification token
-            class_step_indices = class_mask.float().argmax(dim=1)                      # (b,)
-            
-            # get last token
-            b_indices = torch.arange(batch_size, device=device)
-            extracted_probs = stacked_student_probs[b_indices, class_step_indices]     # (b, vocab_size)
-            extracted_targets = stacked_teacher_targets[b_indices, class_step_indices] # (b,)
+        
+        # MERA loss
+        mera_loss_batch = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
+        
+        # Zero out sequences that never reached the classification token
+        mera_loss_batch = mera_loss_batch * valid_mera_batch_mask.float()
+        valid_batch_count = valid_mera_batch_mask.float().sum().clamp(min=1)
+        mera_loss_scalar = mera_loss_batch.sum() / valid_batch_count
 
+        # MERA loss only on the last token 
+        reasoning_only_mask = ~class_mask 
+        mask = and_masks([eos_mask, init_tokens_mask, reasoning_only_mask])
 
-            pos_ids = extracted_targets
-            
-            pos_ids_expanded = rearrange(pos_ids, 'b -> b 1')
-            pos_probs = rearrange(extracted_probs.gather(1, pos_ids_expanded), 'b 1 -> b')
-            
-            eov_probs = extracted_probs[:, self.eov_id]                            
-            neg_probs = extracted_probs.gather(1, padded_negs)                     
-            
-            neg_probs_sum = einsum(neg_probs, valid_neg_mask.float(), 'b n, b n -> b')
-            denom = pos_probs + neg_probs_sum
-            fraction = pos_probs / (denom + 1e-8)
-            contrastive_loss = -torch.log(fraction.clamp(min=1e-8))
-            
-            # Diversity loss
-            term1 = F.relu(eov_probs - pos_probs)
-            eov_probs_expanded = rearrange(eov_probs, 'b -> b 1')
-            term2_raw = F.relu(neg_probs - eov_probs_expanded)
-            
-            term2_sum = einsum(term2_raw, valid_neg_mask.float(), 'b n, b n -> b')
-            num_valid = einsum(valid_neg_mask.float(), 'b n -> b').clamp(min=1)
-            eov_loss = term1 + (term2_sum / num_valid)
+        sdft_loss_scalar = masked_mean(total_step_losses, mask)
+        
+        final_loss = sdft_loss_scalar + mera_loss_scalar
 
-            
-            # MERA loss
-            mera_loss_batch = (self.mera_contrastive_weight * contrastive_loss) + (self.mera_diversity_weight * eov_loss)
-            
-            # Zero out sequences that never reached the classification token
-            mera_loss_batch = mera_loss_batch * valid_mera_batch_mask.float()
-            valid_batch_count = valid_mera_batch_mask.float().sum().clamp(min=1)
-            mera_loss_scalar = mera_loss_batch.sum() / valid_batch_count
-
-            # MERA loss only on the last token 
-            reasoning_only_mask = ~class_mask 
-            mask = and_masks([eos_mask, init_tokens_mask, reasoning_only_mask])
-
-            sdft_loss_scalar = masked_mean(total_step_losses, mask)
-            
-            final_loss = sdft_loss_scalar + mera_loss_scalar
-
-        else:
-            # Standard SDFT applied to the entire valid sequence
-            mask = and_masks([eos_mask, init_tokens_mask])
-
-            final_loss = masked_mean(total_step_losses, mask)
 
         return SDFTOutput(final_loss, student_responses)
     
