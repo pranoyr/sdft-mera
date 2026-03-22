@@ -12,9 +12,7 @@ import json
 
 
 
-# setup tokenizer 
 model_name = "Qwen/Qwen2.5-0.5B-Instruct"
-
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.pad_token = tokenizer.eos_token
 tokenizer.padding_side = 'left'
@@ -31,12 +29,35 @@ def encode_prompt_to_tensor(prompt_string: str) -> torch.Tensor:
     return token_dict
 
 
-icd_special_tokens = ["<ICD_1>", "<ICD_2>", "<ICD_3>", "<ICD_4>", "<ICD_5>", "<ICD_6>", "<ICD_7>", "<ICD_8>", "<ICD_9>", "<ICD_10>"]
+# sample dataset
+class SampleDataset(Dataset):
+    def __init__(self):
+        self.data = [
+                {"question": " patient has fever and cough, what is the diagnosis?",
+                  "answers": ["ICD_1", "ICD_2"],
+                  "hard_negatives": ["ICD_3", "ICD_4"]},
 
+                {"question": " patient has chest pain and shortness of breath, what is the diagnosis?",
+                  "answers": ["ICD_5", "ICD_6"],
+                  "hard_negatives": ["ICD_7", "ICD_8"]}
+                ]
+        
+        def __len__(self):
+            return len(self.data)
+        
+        def __getitem__(self, idx):
+            return self.data[idx]
+        
+train_ds = SampleDataset()
+train_dl = torch.utils.data.DataLoader(train_ds, batch_size=2, shuffle=True)
+
+    
+# add new tokens
+icd_special_tokens = ["<ICD_1>", "<ICD_2>", "<ICD_3>", "<ICD_4>", "<ICD_5>", "<ICD_6>", "<ICD_7>", "<ICD_8>", "<ICD_9>", "<ICD_10>"]
 special_tokens_dict = {'additional_special_tokens': ['<EOV>'] + icd_special_tokens}
+
 num_added_toks = tokenizer.add_special_tokens(special_tokens_dict)
 
-# get the tokens ids
 eov_token_id = tokenizer.convert_tokens_to_ids('<EOV>')
 icd_token_ids = set(tokenizer.convert_tokens_to_ids(icd_special_tokens))
 
@@ -54,7 +75,7 @@ base_model.resize_token_embeddings(len(tokenizer))
 # trainer 
 trainer = MERATrainer(
     model = base_model,
-    dataset = train_dataset,
+    dataset = train_dl,
     tokenizer_encode = encode_prompt_to_tensor, 
     batch_size = 2,
     learning_rate = 2e-5,
